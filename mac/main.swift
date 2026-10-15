@@ -30,6 +30,50 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
         // 앱이 켜져 있는 동안 잠자기 방지 (서버도 caffeinate 로 한 번 더 막음)
         activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated], reason: "Claude 작업 실행")
         startServer()
+        DispatchQueue.main.async { self.setupLidAwake() }
+    }
+
+    // ---- 덮개 닫아도 안 잠들기: pmset -c disablesleep 1 (충전기 연결 중일 때만 적용) ----
+    // 영구 권한 변경(sudoers) 없이, 앱을 열 때 관리자 암호 1번. 앱이 끝나면(종료/강제종료/크래시) 자동 복구
+    let lidKey = "lidAwake"
+    var lidItem: NSMenuItem!
+    var lidOn = false
+
+    func runAdmin(_ cmd: String) -> Bool {
+        var err: NSDictionary?
+        NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges")?.executeAndReturnError(&err)
+        return err == nil
+    }
+
+    func enableLidAwake() {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        // 켜면서, 이 앱 프로세스가 사라질 때까지 기다렸다가 0 으로 되돌리는 감시를 같이 띄움
+        lidOn = runAdmin("/usr/bin/pmset -c disablesleep 1; /usr/bin/nohup /bin/sh -c 'while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/pmset -c disablesleep 0' >/dev/null 2>&1 &")
+        lidItem.state = lidOn ? .on : .off
+    }
+
+    func setupLidAwake() {
+        let d = UserDefaults.standard
+        if d.object(forKey: lidKey) == nil {
+            let a = NSAlert()
+            a.messageText = "덮개를 닫아도 작업이 계속되게 할까요?"
+            a.informativeText = "충전기가 연결돼 있을 때만 적용되고, 앱을 종료하면 원래대로 돌아갑니다.\n켜 두면 앱을 열 때마다 관리자 암호를 한 번 물어봐요. 메뉴에서 언제든 바꿀 수 있어요."
+            a.addButton(withTitle: "켜기")
+            a.addButton(withTitle: "안 함")
+            d.set(a.runModal() == .alertFirstButtonReturn, forKey: lidKey)
+        }
+        if d.bool(forKey: lidKey) { enableLidAwake() }
+    }
+
+    @objc func toggleLid() {
+        if lidOn {
+            if runAdmin("/usr/bin/pmset -c disablesleep 0") { lidOn = false }
+            UserDefaults.standard.set(false, forKey: lidKey)
+        } else {
+            UserDefaults.standard.set(true, forKey: lidKey)
+            enableLidAwake()
+        }
+        lidItem.state = lidOn ? .on : .off
     }
 
     // Finder 에서 실행된 앱은 PATH 가 짧아 node/claude 를 못 찾으므로 로그인 셸 PATH 를 가져옴
@@ -129,8 +173,10 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
         }
         let android = NSMenuItem(title: "Android 앱 설치…", action: #selector(showAndroid), keyEquivalent: "a")
         android.keyEquivalentModifierMask = [.command, .shift]
+        lidItem = NSMenuItem(title: "덮개 닫아도 계속 실행 (충전 중)", action: #selector(toggleLid), keyEquivalent: "")
         sub("Token Relay", [
             android,
+            lidItem,
             .separator(),
             NSMenuItem(title: "Token Relay 종료 (작업도 멈춤)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"),
         ])
