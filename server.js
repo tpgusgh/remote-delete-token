@@ -36,7 +36,7 @@ const blockedUntil = a => Math.max(
   a.util7d >= LIMIT ? a.reset7d || 0 : 0,
   a.limitedUntil || 0,
 );
-const usable = a => !a.bad && blockedUntil(a) <= now();
+const usable = a => !a.bad && !a.disabled && blockedUntil(a) <= now();
 
 function log(t, line) {
   t.log.push(`[${new Date().toLocaleTimeString('ko-KR')}] ${line}`);
@@ -44,6 +44,7 @@ function log(t, line) {
 }
 
 let child = null; // ponytail: 한 번에 작업 하나. 병렬 필요하면 계정별 슬롯으로 확장
+let current = null; // 실행 중인 계정 + 전환 함수 (계정 끄면 즉시 다음 계정으로)
 let waitingLogged = false;
 
 function tick() {
@@ -99,12 +100,12 @@ function applyUsage(a, ev) {
 
 // 모든 계정이 막혔을 때 가장 먼저 풀리는 시각
 const waitUntil = () => {
-  const ts = db.accounts.filter(a => !a.bad).map(blockedUntil).filter(t => t > now());
+  const ts = db.accounts.filter(a => !a.bad && !a.disabled).map(blockedUntil).filter(t => t > now());
   return ts.length ? Math.min(...ts) : null;
 };
 // 등록된 계정 중 가장 먼저 오는 주간(7일) 리셋 시각
 const nextWeeklyReset = () => {
-  const ts = db.accounts.map(a => a.reset7d).filter(t => t > now());
+  const ts = db.accounts.filter(a => !a.disabled).map(a => a.reset7d).filter(t => t > now());
   return ts.length ? Math.min(...ts) : null;
 };
 
@@ -142,6 +143,8 @@ function run(t, a) {
     log(t, `⚠ [${a.name}] ${why} → 다음 계정으로 전환`);
     p.kill('SIGTERM');
   };
+  current = { a, switchAccount };
+  p.on('close', () => (current = null));
 
   readline.createInterface({ input: p.stdout }).on('line', line => {
     let ev;
@@ -390,6 +393,14 @@ async function handle(req, res) {
     return send(200, { ok: true, name: L.account.name });
   }
   if (kind === 'accounts' && acc && action === 'probe') { await probe(acc); return send(200, { ok: true }); }
+  // 사용 / 사용 안 함 토글. 실행 중인 계정을 끄면 바로 다음 계정으로 이어서 진행
+  if (kind === 'accounts' && acc && action === 'toggle') {
+    acc.disabled = !acc.disabled;
+    save();
+    if (acc.disabled && current?.a === acc) current.switchAccount('사용 안 함으로 변경');
+    else tick();
+    return send(200, { ok: true, disabled: acc.disabled });
+  }
   if (kind === 'accounts' && acc && action === 'up') {
     const i = db.accounts.indexOf(acc);
     if (i > 0) [db.accounts[i - 1], db.accounts[i]] = [db.accounts[i], db.accounts[i - 1]];

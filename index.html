@@ -69,6 +69,10 @@
   .mcp .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--bad); }
   .mcp .dot.ok { background: var(--ok); } .mcp .dot.warn { background: var(--warn); }
   select.model { min-width: 0; }
+  .switch { width: 48px; min-height: 28px; height: 28px; padding: 0; border-radius: 99px; background: var(--line); border: 0; position: relative; flex: none; transition: background .15s; }
+  .switch i { position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #0004; transition: transform .15s; }
+  .switch.on { background: var(--ok); } .switch.on i { transform: translateX(20px); }
+  .card.off > :not(.row:first-child) { opacity: .45; }
 </style>
 </head>
 <body>
@@ -189,10 +193,12 @@ const label = { queued: '대기', running: '실행 중', done: '완료', error: 
 function renderAccounts(s) {
   $('#limit').textContent = `· ${pct(s.limit)}% 도달 시 자동 전환`;
   $('#accounts').innerHTML = s.accounts.map((a, i) => `
-    <div class="card">
+    <div class="card ${a.disabled ? 'off' : ''}">
       <div class="row">
         <strong class="grow">${i + 1}. ${esc(a.name)}</strong>
-        <span class="pill ${a.bad ? 'bad' : ''}">${a.bad ? '토큰 오류' : a.usable ? '사용 가능' : '한도 · ' + timeText(a.blockedUntil) + ' 재개'}</span>
+        <span class="pill ${a.bad ? 'bad' : ''}">${a.disabled ? '사용 안 함' : a.bad ? '토큰 오류' : a.usable ? '사용 가능' : '한도 · ' + timeText(a.blockedUntil) + ' 재개'}</span>
+        <button class="switch ${a.disabled ? '' : 'on'}" role="switch" aria-checked="${!a.disabled}" aria-label="${esc(a.name)} 사용"
+          data-act="accounts/${a.id}/toggle" data-method="POST"><i></i></button>
       </div>
       <div class="muted">${esc(a.token)}${a.updated ? ' · 갱신 ' + timeText(a.updated) : ''}</div>
       ${a.error ? `<div class="err">${esc(a.error)}</div>` : ''}
