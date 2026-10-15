@@ -1,0 +1,14 @@
+# 빌드 산출물 (APK/앱에 내 Tailscale 주소가 들어감)
+build/
+dist/
+*.apk
+*.idsig
+*.dmg
+
+# 비밀: APK 서명 키, 계정 토큰이 든 데이터
+*.keystore
+*.jks
+data.json
+mcp-extra.json
+
+.DS_Store
