@@ -38,9 +38,19 @@ const blockedUntil = a => Math.max(
 );
 const usable = a => !a.bad && !a.disabled && blockedUntil(a) <= now();
 
-function log(t, line) {
-  t.log.push(`[${new Date().toLocaleTimeString('ko-KR')}] ${line}`);
+// 대화 기록: k = user(요청) | text(응답) | tool(도구 호출) | out(도구 결과) | sys(시스템 안내)
+function log(t, text, k = 'sys', extra) {
+  t.log.push({ k, text: String(text).slice(0, 4000), at: now(), ...extra });
   if (t.log.length > 500) t.log.splice(0, t.log.length - 500);
+}
+
+// 도구 호출을 Claude Code 처럼 한 줄로: Bash(npm install), Write(src/app.js)
+function toolArg(input, cwd) {
+  const i = input || {};
+  const rel = p => (p && cwd && p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p);
+  const v = i.command ?? rel(i.file_path ?? i.notebook_path) ?? i.pattern ?? i.url ?? i.query ?? i.description
+    ?? i.skill ?? (i.todos ? `할 일 ${i.todos.length}개` : null) ?? Object.values(i).find(x => typeof x === 'string');
+  return String(v ?? '').replace(/\s+/g, ' ').slice(0, 200);
 }
 
 let child = null; // ponytail: 한 번에 작업 하나. 병렬 필요하면 계정별 슬롯으로 확장
@@ -63,7 +73,8 @@ function tick() {
 }
 
 function spawnClaude(prompt, cwd, a, resume, extra = []) {
-  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions', ...extra];
+  // --include-partial-messages: 메시지가 끝나기 전에도 생각/작성 중인 내용을 실시간으로 받음
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--dangerously-skip-permissions', ...extra];
   if (resume) args.push('--resume', resume);
   const env = { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: a.token };
   delete env.ANTHROPIC_API_KEY; // API 키가 있으면 OAuth 토큰보다 우선하므로 제거
@@ -132,7 +143,10 @@ function run(t, a) {
   t.account = a.name;
   t.switched = false;
   t.retryAt = null;
-  log(t, `▶ 계정 [${a.name}] 으로 실행${t.iter ? ` (반복 ${t.iter + 1}회차)` : ''}${resume ? ' (세션 이어서)' : ''}`);
+  t.startedAt = now();
+  t.live = '⏳ 시작 중…';
+  log(t, `계정 [${a.name}] 으로 실행${t.iter ? ` · 반복 ${t.iter + 1}회차` : ''}${resume ? ' · 세션 이어서' : ''}`);
+  log(t, prompt, 'user');
   save();
 
   const p = (child = spawnClaude(prompt, t.cwd || os.homedir(), a, resume, taskArgs(t)));
@@ -149,13 +163,38 @@ function run(t, a) {
   readline.createInterface({ input: p.stdout }).on('line', line => {
     let ev;
     try { ev = JSON.parse(line); } catch { return log(t, line); }
-    if (ev.type === 'system' && ev.subtype === 'init') t.sessionId = ev.session_id;
-    else if (ev.type === 'rate_limit_event') {
+    if (ev.type === 'system' && ev.subtype === 'init') {
+      t.sessionId = ev.session_id;
+      t.live = `⏳ ${ev.model} 응답 대기 중…`;
+    } else if (ev.type === 'stream_event') {
+      // 실시간 진행 상황 (로그에는 안 남기고 화면 상태로만)
+      const e = ev.event;
+      if (e.type === 'content_block_start') {
+        const b = e.content_block;
+        t.live = b.type === 'thinking' ? '💭 생각 중…' : b.type === 'tool_use' ? `🔧 ${b.name} 준비 중` : '✍️ 답변 작성 중';
+        t.liveText = '';
+        t.liveBytes = 0;
+      } else if (e.type === 'content_block_delta') {
+        const d = e.delta;
+        if (d.type === 'text_delta') t.liveText = (t.liveText + d.text).slice(-300);
+        else if (d.type === 'thinking_delta') t.liveText = (t.liveText + d.thinking).slice(-300);
+        else if (d.type === 'input_json_delta') t.liveBytes += d.partial_json.length;
+      }
+    } else if (ev.type === 'user') {
+      // 도구 실행 결과
+      for (const c of ev.message?.content || []) {
+        if (c.type !== 'tool_result') continue;
+        const text = Array.isArray(c.content) ? c.content.map(x => x.text || (x.type === 'image' ? '[이미지]' : '')).join('\n') : String(c.content || '');
+        log(t, text.trim().slice(0, 800) || '(출력 없음)', 'out', { ok: !c.is_error });
+        t.live = '⏳ 다음 단계 생각 중…';
+        t.liveText = '';
+      }
+    } else if (ev.type === 'rate_limit_event') {
       if (applyUsage(a, ev)) switchAccount(`사용량 ${Math.round(maxUtil(a) * 100)}% 도달`);
     } else if (ev.type === 'assistant') {
       for (const c of ev.message?.content || []) {
-        if (c.type === 'text' && c.text.trim()) log(t, c.text);
-        if (c.type === 'tool_use') log(t, `🔧 ${c.name} ${JSON.stringify(c.input).slice(0, 200)}`);
+        if (c.type === 'text' && c.text.trim()) log(t, c.text.trim(), 'text');
+        if (c.type === 'tool_use') log(t, toolArg(c.input, t.cwd), 'tool', { name: c.name });
       }
     } else if (ev.type === 'result') {
       t.result = ev.result;
@@ -169,12 +208,13 @@ function run(t, a) {
     }
   });
   readline.createInterface({ input: p.stderr }).on('line', l => {
-    log(t, `stderr: ${l}`);
+    log(t, l);
     if (AUTH_RE.test(l)) { a.bad = true; switchAccount('토큰 인증 실패'); }
   });
 
   p.on('close', code => {
     child = null;
+    t.live = t.liveText = null;
     if (switching) { t.status = 'queued'; t.switched = !!t.sessionId; }
     else if (t.stopRequested) t.status = 'stopped';
     else if (t.loop && code === 0) {
@@ -336,6 +376,45 @@ function checkMcp() {
 }
 
 const MODEL_RE = /^[\w.\-\[\]]{0,60}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ---- Claude Code 세션 목록: ~/.claude/projects/<폴더 경로의 영숫자 외 문자를 - 로>/<세션ID>.jsonl ----
+function readChunk(f, start, len) {
+  const fd = fs.openSync(f, 'r');
+  const b = Buffer.alloc(len);
+  const n = fs.readSync(fd, b, 0, len, start);
+  fs.closeSync(fd);
+  return b.subarray(0, n).toString('utf8');
+}
+const userText = e => {
+  const c = e.message?.content;
+  const s = typeof c === 'string' ? c : Array.isArray(c) ? c.find(x => x.type === 'text')?.text : '';
+  return s && !e.isMeta && !s.startsWith('<') ? s : '';
+};
+function listSessions(cwd) {
+  const dir = path.join(os.homedir(), '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
+  let files;
+  try { files = fs.readdirSync(dir).filter(f => UUID_RE.test(f.replace(/\.jsonl$/, '')) && f.endsWith('.jsonl')); } catch { return []; }
+  return files.map(f => {
+    const file = path.join(dir, f);
+    const { size, mtimeMs } = fs.statSync(file);
+    // 큰 파일도 빠르게: 앞 128KB(첫 요청) + 뒤 128KB(최신 제목/마지막 요청)만 읽음. 뒤가 나중이라 덮어씀
+    const chunk = 131072;
+    const text = readChunk(file, 0, chunk) + '\n' + (size > chunk ? readChunk(file, Math.max(chunk, size - chunk), chunk) : '');
+    let first = '', custom = '', ai = '', last = '';
+    for (const l of text.split('\n')) {
+      if (!l.startsWith('{')) continue;
+      let e;
+      try { e = JSON.parse(l); } catch { continue; }
+      if (e.type === 'custom-title') custom = e.customTitle;
+      else if (e.type === 'ai-title') ai = e.aiTitle;
+      else if (e.type === 'last-prompt') last = e.lastPrompt;
+      else if (e.type === 'user' && !first) first = userText(e);
+    }
+    const title = (custom || ai || first || last).replace(/\s+/g, ' ').slice(0, 80);
+    return title && { id: f.replace(/\.jsonl$/, ''), updated: mtimeMs / 1000, title, last: last.slice(0, 120) };
+  }).filter(Boolean).sort((x, y) => y.updated - x.updated).slice(0, 40);
+}
 const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 async function handle(req, res) {
@@ -439,6 +518,12 @@ async function handle(req, res) {
     return send(200, { path: dir });
   }
 
+  // 폴더의 기존 Claude Code 세션 목록 (VS Code/터미널에서 쓰던 것 포함)
+  if (kind === 'sessions' && m === 'GET') {
+    const cwd = path.resolve((url.searchParams.get('cwd') || '~').replace(/^~/, os.homedir()));
+    return send(200, listSessions(cwd));
+  }
+
   // 연결된 MCP 상태 (?refresh=1 이면 다시 확인)
   if (kind === 'mcp' && m === 'GET') {
     if (url.searchParams.get('refresh') || !mcp.checked) checkMcp();
@@ -449,6 +534,7 @@ async function handle(req, res) {
     const { prompt, cwd, resume, model = '', effort = '', loop = false, loopPrompt = '', untilWeekly = false } = await body(req);
     if (!prompt?.trim()) return send(400, { error: '작업 내용 필요' });
     if (!MODEL_RE.test(model) || !EFFORTS.includes(effort)) return send(400, { error: '모델/effort 값 오류' });
+    if (resume && !UUID_RE.test(resume)) return send(400, { error: '세션 ID 형식 오류' });
     const dir = (cwd || '').trim().replace(/^~/, os.homedir()) || os.homedir();
     if (!fs.existsSync(dir)) return send(400, { error: `폴더 없음: ${dir}` });
     db.tasks.push({

@@ -61,8 +61,26 @@
   .browser { border: 1px solid var(--line); border-radius: 8px; max-height: 320px; overflow: auto; }
   .browser .cur { position: sticky; top: 0; background: var(--card); padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 13px; word-break: break-all; }
   .browser .d { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; border-bottom: 1px solid var(--line); padding: 10px 12px; }
-  .live { margin-top: 8px; padding: 8px 10px; border-left: 3px solid var(--accent); background: var(--bg); border-radius: 0 6px 6px 0;
-          font-size: 13px; white-space: pre-wrap; word-break: break-word; max-height: 7.5em; overflow: hidden; }
+  /* 대화 기록 (Claude Code 터미널 느낌) */
+  .tr { margin-top: 10px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+        max-height: 60vh; overflow: auto; font: 13px/1.55 ui-monospace, "SF Mono", Menlo, monospace; }
+  .tr.result { max-height: 40vh; font-family: inherit; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+  .tr pre { margin: 6px 0; max-height: none; font-size: 12px; background: var(--card); }
+  .tr code { background: var(--card); }
+  .e { display: flex; gap: 8px; margin: 3px 0; white-space: pre-wrap; word-break: break-word; }
+  .e .b { flex: none; width: 1em; }
+  .e.user { display: block; margin: 10px 0 8px; padding: 8px 10px; background: var(--card); border-left: 3px solid var(--muted);
+            border-radius: 0 6px 6px 0; color: var(--text); }
+  .e.user::before { content: "› "; color: var(--muted); }
+  .e.text { margin-top: 8px; } .e.text .b { color: var(--text); }
+  .e.tool { margin-top: 8px; } .e.tool .b { color: var(--ok); } .e.tool .arg { color: var(--muted); }
+  .e.out { padding-left: 1.4em; color: var(--muted); font-size: 12px; } .e.out.bad { color: var(--bad); }
+  .e.sys { color: var(--muted); font-size: 12px; font-style: italic; }
+  .e.live { margin-top: 10px; color: var(--accent); }
+  .e.live .preview { color: var(--muted); font-size: 12px; margin-top: 2px; max-height: 3.2em; overflow: hidden; }
+  .spin { display: inline-block; animation: spin 1.6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
   .steps { margin: 10px 0; padding-left: 20px; font-size: 14px; } .steps li { margin-bottom: 4px; }
   .steps a { color: var(--accent); font-weight: 600; }
   .mcp { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 14px; } .mcp:last-child { border-bottom: 0; }
@@ -90,6 +108,10 @@
         <button type="button" id="fav" title="즐겨찾기에 추가">☆</button>
       </div>
       <div class="row" id="favs"></div>
+      <div class="row">
+        <select id="session" class="grow" style="min-width:0"><option value="">✦ 새 세션</option></select>
+        <button type="button" id="sessreload" title="세션 목록 새로고침" aria-label="세션 목록 새로고침">↻</button>
+      </div>
       <div id="browser" class="browser" hidden></div>
       <div class="row">
         <select id="model" class="grow model"></select>
@@ -187,7 +209,11 @@ const meter = (label, x, limit, reset) => {
   return `<div><div class="row muted"><span class="grow">${label}</span><span>${pct(x)}%</span></div><div class="bar"><i class="${cls}" style="width:${pct(x)}%"></i></div>` +
     (reset ? `<div class="muted" style="font-size:12px">${timeText(reset)} 리셋</div>` : '') + '</div>';
 };
-const lastLine = t => (t.log[t.log.length - 1] || '').replace(/^\[[^\]]*\]\s*/, '');
+const lastLine = t => { const e = t.log[t.log.length - 1] || ''; return typeof e === 'string' ? e.replace(/^\[[^\]]*\]\s*/, '') : e.text; };
+const elapsed = t0 => {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - (t0 || Date.now() / 1000)));
+  return s < 60 ? `${s}초` : s < 3600 ? `${Math.floor(s / 60)}분 ${s % 60}초` : `${Math.floor(s / 3600)}시간 ${Math.floor(s % 3600 / 60)}분`;
+};
 const label = { queued: '대기', running: '실행 중', done: '완료', error: '오류', stopped: '중지' };
 
 function renderAccounts(s) {
@@ -212,26 +238,64 @@ function renderAccounts(s) {
     </div>`).join('') || '<p class="muted">등록된 계정 없음</p>';
 }
 
+// ---- 대화 기록을 Claude Code 처럼 ----
+// 최소 마크다운: 코드블록, 인라인 코드, 굵게, 제목
+const md = s => esc(s)
+  .replace(/```[\w-]*\n?([\s\S]*?)```/g, (_, c) => `<pre>${c.replace(/\n$/, '')}</pre>`)
+  .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+  .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+  .replace(/^#{1,4} (.+)$/gm, '<b>$1</b>');
+function entry(e) {
+  if (typeof e === 'string') return `<div class="e sys">${esc(e.replace(/^\[[^\]]*\]\s*/, ''))}</div>`; // 예전 형식
+  if (e.k === 'user') return `<div class="e user">${esc(e.text)}</div>`;
+  if (e.k === 'text') return `<div class="e text"><span class="b">●</span><div class="grow">${md(e.text)}</div></div>`;
+  if (e.k === 'tool') return `<div class="e tool"><span class="b">●</span><div class="grow"><b>${esc(e.name)}</b>(<span class="arg">${esc(e.text)}</span>)</div></div>`;
+  if (e.k === 'out') {
+    const lines = e.text.split('\n');
+    return `<div class="e out ${e.ok ? '' : 'bad'}"><span>⎿</span><div class="grow">${esc(lines.slice(0, 3).join('\n'))}` +
+      `${lines.length > 3 ? ` <span class="muted">… +${lines.length - 3}줄</span>` : ''}</div></div>`;
+  }
+  return `<div class="e sys">${esc(e.text)}</div>`;
+}
+function transcript(t) {
+  const liveLine = t.status === 'running'
+    ? `<div class="e live"><span class="spin" style="animation-delay:-${(Date.now() % 1600) / 1000}s">✻</span><div class="grow">${esc((t.live || '실행 중').replace(/^\S+ /, ''))}` +
+      `${t.liveBytes ? ` · ${t.liveBytes.toLocaleString()}자` : ''} <span class="muted">· ${elapsed(t.startedAt)}</span>` +
+      `${t.liveText ? `<div class="muted preview">${esc(t.liveText.split('\n').slice(-2).join('\n'))}</div>` : ''}</div></div>`
+    : '';
+  return t.log.map(entry).join('') + liveLine;
+}
+
 function renderTasks(s) {
+  // 다시 그려도 읽던 위치 유지: 맨 아래 보고 있었으면 계속 맨 아래로
+  const pos = {};
+  document.querySelectorAll('[data-tr]').forEach(el => {
+    pos[el.dataset.tr] = el.scrollHeight - el.scrollTop - el.clientHeight < 40 ? 'bottom' : el.scrollTop;
+  });
   $('#tasks').innerHTML = s.tasks.map(t => `
     <div class="card">
       <div class="row">
         <span class="pill ${t.status}">${label[t.status] || t.status}</span>
         ${t.loop ? `<span class="pill">↻ 반복 ${t.iter || 0}회</span>` : ''}
-        <span class="muted grow">${esc(t.cwd)}${t.account ? ' · ' + esc(t.account) : ''}${t.model ? ' · ' + esc(t.model) : ''}${t.effort ? ' · ' + esc(t.effort) : ''}</span>
+        <span class="muted grow">${esc(t.cwd)}${t.account ? ' · ' + esc(t.account) : ''}${t.model ? ' · ' + esc(t.model) : ''}${t.effort ? ' · ' + esc(t.effort) : ''}${t.resume ? ' · 기존 세션' : ''}</span>
       </div>
-      <div class="prompt" style="margin-top:6px">${esc(t.prompt)}</div>
       ${t.untilWeekly ? `<div class="muted">⏹ ${t.stopAt ? timeText(t.stopAt) + ' 주간 리셋 때 자동 중지' : '주간 리셋 때 자동 중지 (리셋 시각 확인 중)'}</div>` : ''}
-      ${['running', 'queued'].includes(t.status) && t.log.length ? `<div class="live">${esc(lastLine(t))}</div>` : ''}
-      ${t.result && t.status !== 'running' ? `<pre>${esc(t.result)}</pre>` : ''}
-      <details ${open.has(t.id) ? 'open' : ''} data-log="${t.id}"><summary>로그 ${t.log.length}줄</summary><pre>${esc(t.log.join('\n'))}</pre></details>
+      ${t.status === 'running'
+        ? `<div class="tr" data-tr="${t.id}">${transcript(t)}</div>`
+        : `<div class="prompt" style="margin-top:6px">${esc(t.prompt)}</div>
+           ${t.status === 'queued' && t.log.length ? `<div class="e sys" style="margin-top:6px">${esc(lastLine(t))}</div>` : ''}
+           ${t.result ? `<div class="tr result">${md(t.result)}</div>` : ''}
+           <details ${open.has(t.id) ? 'open' : ''} data-log="${t.id}"><summary>대화 보기 (${t.log.length})</summary><div class="tr" data-tr="${t.id}">${transcript(t)}</div></details>`}
       <div class="row" style="margin-top:10px">
         ${t.sessionId && t.status !== 'running' ? `<input class="grow followup" placeholder="이어서 시킬 일" data-session="${t.sessionId}" data-cwd="${esc(t.cwd)}"><button data-follow>보내기</button>` : '<span class="grow"></span>'}
         ${['queued', 'running'].includes(t.status) ? `<button data-act="tasks/${t.id}/stop" data-method="POST">중지</button>`
           : `${t.sessionId ? `<button data-act="tasks/${t.id}/resume" data-method="POST">재개</button>` : ''}<button data-act="tasks/${t.id}" data-method="DELETE">삭제</button>`}
       </div>
     </div>`).join('') || '<p class="muted">작업 없음</p>';
-  document.querySelectorAll('[data-log] pre').forEach(p => (p.scrollTop = p.scrollHeight));
+  document.querySelectorAll('[data-tr]').forEach(el => {
+    const p = pos[el.dataset.tr];
+    el.scrollTop = p === undefined || p === 'bottom' ? el.scrollHeight : p;
+  });
 }
 
 let last = '';
@@ -246,9 +310,10 @@ async function refresh() {
       : queued ? `대기 ${queued}` : '쉬는 중';
     $('#weekly').textContent = s.weeklyReset ? `(${timeText(s.weeklyReset)})` : '';
     const j = JSON.stringify(s);
-    // 이어서 입력 중이면 다시 그리지 않음 (타이핑 보존)
-    if (j !== last && !document.activeElement?.classList.contains('followup')) {
-      last = j; renderAccounts(s); renderTasks(s); renderFavs(s); renderSettings(s);
+    // 이어서 입력 중이면 다시 그리지 않음 (타이핑 보존). 실행 중이면 경과 시간 갱신 위해 매번 그림
+    if (!document.activeElement?.classList.contains('followup')) {
+      if (j !== last) { last = j; renderAccounts(s); renderTasks(s); renderFavs(s); renderSettings(s); }
+      else if (running) renderTasks(s);
     }
   } catch { $('#dot').classList.remove('live'); }
 }
@@ -322,11 +387,11 @@ document.addEventListener('click', e => {
   const b = e.target.closest('button');
   if (!b) return;
   if (b.dataset.dir) browse(b.dataset.dir);
-  if (b.dataset.pick) { $('#cwd').value = b.dataset.pick; $('#browser').hidden = true; }
+  if (b.dataset.pick) { $('#cwd').value = b.dataset.pick; $('#browser').hidden = true; loadSessions(); }
   if (b.dataset.unfav) saveSettings({ folders: S.settings.folders.filter((_, i) => i !== +b.dataset.unfav) });
   if (b.dataset.mkdir) {
     api('dirs', 'POST', { path: b.dataset.mkdir, name: $('#newdir').value })
-      .then(r => { $('#cwd').value = r.path; browse(r.path); })
+      .then(r => { $('#cwd').value = r.path; browse(r.path); loadSessions(); })
       .catch(err => ($('#taskerr').textContent = err.message));
   }
 });
@@ -345,6 +410,22 @@ async function loadMcp(refresh) {
 }
 $('#mcprefresh').onclick = () => loadMcp(true);
 loadMcp();
+
+// ---- 세션: 새 세션 또는 이 폴더의 기존 Claude Code 세션 이어서 ----
+async function loadSessions() {
+  const cwd = absPath($('#cwd').value) || '~';
+  const keep = $('#session').value;
+  try {
+    const list = await api('sessions?cwd=' + encodeURIComponent(cwd));
+    $('#session').innerHTML = '<option value="">✦ 새 세션</option>' + list.map(x =>
+      `<option value="${x.id}" title="${esc(x.last)}">↩ ${timeText(x.updated)} · ${esc(x.title)}</option>`).join('');
+    if (list.some(x => x.id === keep)) $('#session').value = keep;
+  } catch {}
+}
+let sessTimer;
+$('#cwd').addEventListener('input', () => { clearTimeout(sessTimer); sessTimer = setTimeout(loadSessions, 600); });
+$('#sessreload').onclick = loadSessions;
+setTimeout(loadSessions, 300); // 첫 상태(home 경로) 받은 뒤
 
 // ---- 설정 ----
 function renderSettings(s) {
@@ -373,10 +454,11 @@ $('#taskform').onsubmit = async e => {
     await api('tasks', 'POST', {
       prompt: $('#prompt').value, cwd: $('#cwd').value, model: $('#model').value, effort: $('#effort').value,
       loop: $('#loop').checked, loopPrompt: $('#loopPrompt').value, untilWeekly: $('#untilWeekly').checked,
+      resume: $('#session').value || undefined,
     });
     store.set('model', $('#model').value); store.set('effort', $('#effort').value);
     store.set('cwd', $('#cwd').value);
-    $('#prompt').value = ''; last = ''; refresh();
+    $('#prompt').value = ''; $('#session').value = ''; last = ''; refresh();
   } catch (err) { $('#taskerr').textContent = err.message; }
 };
 // ---- Claude 계정 연결: 서버가 claude setup-token 을 대신 실행 ----
