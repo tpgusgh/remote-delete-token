@@ -45,11 +45,23 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
         return err == nil
     }
 
+    let pid = ProcessInfo.processInfo.processIdentifier
+
     func enableLidAwake() {
-        let pid = ProcessInfo.processInfo.processIdentifier
-        // 켜면서, 이 앱 프로세스가 사라질 때까지 기다렸다가 0 으로 되돌리는 감시를 같이 띄움
-        lidOn = runAdmin("/usr/bin/pmset -c disablesleep 1; /usr/bin/nohup /bin/sh -c 'while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/pmset -c disablesleep 0' >/dev/null 2>&1 &")
+        // 켜면서, 이 앱 프로세스가 사라질 때까지 기다렸다가 0 으로 되돌리는 감시를 같이 띄움 (종료 신호 무시, 입출력 분리)
+        lidOn = runAdmin("/usr/bin/pmset -c disablesleep 1; /usr/bin/nohup /bin/sh -c 'trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/pmset -c disablesleep 0' </dev/null >/dev/null 2>&1 &")
         lidItem.state = lidOn ? .on : .off
+    }
+
+    // 감시 프로세스가 살아 있는지 (명령줄에 이 앱 pid 가 들어 있음)
+    func lidWatcherAlive() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        p.arguments = ["-f", "kill -0 \(pid) "]
+        p.standardOutput = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        return p.terminationStatus == 0
     }
 
     func setupLidAwake() {
@@ -201,6 +213,8 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
 
     func applicationWillTerminate(_ n: Notification) {
         quitting = true
+        // 감시가 죽었으면 직접 원래대로 (관리자 암호 한 번 더)
+        if lidOn && !lidWatcherAlive() { _ = runAdmin("/usr/bin/pmset -c disablesleep 0") }
         server?.terminate()
         server?.waitUntilExit()
     }
