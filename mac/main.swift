@@ -34,10 +34,26 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
     }
 
     // ---- 덮개 닫아도 안 잠들기: pmset -c disablesleep 1 (충전기 연결 중일 때만 적용) ----
-    // 영구 권한 변경(sudoers) 없이, 앱을 열 때 관리자 암호 1번. 앱이 끝나면(종료/강제종료/크래시) 자동 복구
+    // "항상 허용": 이 pmset 명령 두 개만 암호 없이 실행하도록 sudoers 규칙 설치 (관리자 암호 1번, 메뉴에서 해제)
+    // 항상 허용 안 하면: 앱 열 때마다 관리자 암호. 어느 쪽이든 앱이 끝나면(종료/강제종료/크래시) 자동 복구
     let lidKey = "lidAwake"
+    let rulePath = "/etc/sudoers.d/tokenrelay"
     var lidItem: NSMenuItem!
+    var alwaysItem: NSMenuItem!
     var lidOn = false
+    let pid = ProcessInfo.processInfo.processIdentifier
+
+    func run(_ path: String, _ args: [String]) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
 
     func runAdmin(_ cmd: String) -> Bool {
         var err: NSDictionary?
@@ -45,12 +61,53 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
         return err == nil
     }
 
-    let pid = ProcessInfo.processInfo.processIdentifier
+    // 규칙이 있으면 sudo -n 으로 암호 없이 실행 가능 (-l 은 확인만, 실행 안 함)
+    var alwaysAllowed: Bool { run("/usr/bin/sudo", ["-n", "-l", "/usr/bin/pmset", "-c", "disablesleep", "1"]) }
+    func sudoPmset(_ v: Int) -> Bool { run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-c", "disablesleep", "\(v)"]) }
+
+    func installRule() -> Bool {
+        let user = NSUserName().filter { $0.isLetter || $0.isNumber || "._-".contains($0) }
+        let rule = "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -c disablesleep 1, /usr/bin/pmset -c disablesleep 0"
+        // visudo 로 문법 검사 통과한 것만 설치 (잘못된 sudoers 는 sudo 전체를 망가뜨림)
+        _ = runAdmin("f=$(/usr/bin/mktemp) && /bin/echo '\(rule)' > $f && /usr/sbin/visudo -cf $f && /usr/bin/install -m 440 -o root -g wheel $f \(rulePath); r=$?; /bin/rm -f $f; exit $r")
+        let ok = alwaysAllowed
+        if !ok {
+            let a = NSAlert()
+            a.messageText = "항상 허용을 설정하지 못했어요"
+            a.informativeText = "암호를 취소했거나 이 Mac 의 sudo 설정이 /etc/sudoers.d 를 읽지 않아요. 앱을 열 때마다 암호를 묻는 방식으로 동작합니다."
+            a.runModal()
+        }
+        return ok
+    }
 
     func enableLidAwake() {
-        // 켜면서, 이 앱 프로세스가 사라질 때까지 기다렸다가 0 으로 되돌리는 감시를 같이 띄움 (종료 신호 무시, 입출력 분리)
-        lidOn = runAdmin("/usr/bin/pmset -c disablesleep 1; /usr/bin/nohup /bin/sh -c 'trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/pmset -c disablesleep 0' </dev/null >/dev/null 2>&1 &")
+        if alwaysAllowed {
+            lidOn = sudoPmset(1)
+            // 앱이 어떻게 끝나든 원래대로: 사용자 권한 감시 프로세스 (sudo -n 이라 암호 없음)
+            if lidOn {
+                let w = Process()
+                w.executableURL = URL(fileURLWithPath: "/bin/sh")
+                w.arguments = ["-c", "trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/sudo -n /usr/bin/pmset -c disablesleep 0"]
+                w.standardInput = FileHandle.nullDevice
+                w.standardOutput = FileHandle.nullDevice
+                w.standardError = FileHandle.nullDevice
+                try? w.run()
+            }
+        } else {
+            // 켜면서, 이 앱 프로세스가 사라질 때까지 기다렸다가 0 으로 되돌리는 root 감시를 같이 띄움
+            lidOn = runAdmin("/usr/bin/pmset -c disablesleep 1; /usr/bin/nohup /bin/sh -c 'trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/pmset -c disablesleep 0' </dev/null >/dev/null 2>&1 &")
+        }
+        updateLidMenu()
+    }
+
+    func disableLidAwake() {
+        if alwaysAllowed ? sudoPmset(0) : runAdmin("/usr/bin/pmset -c disablesleep 0") { lidOn = false }
+        updateLidMenu()
+    }
+
+    func updateLidMenu() {
         lidItem.state = lidOn ? .on : .off
+        alwaysItem.state = alwaysAllowed ? .on : .off
     }
 
     // 감시 프로세스가 살아 있는지 (명령줄에 이 앱 pid 가 들어 있음)
@@ -66,26 +123,35 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
 
     func setupLidAwake() {
         let d = UserDefaults.standard
-        if d.object(forKey: lidKey) == nil {
+        // 처음 실행, 또는 켜 놨지만 아직 항상 허용을 안 물어본 경우 한 번 묻기
+        if d.object(forKey: lidKey) == nil || (d.bool(forKey: lidKey) && !d.bool(forKey: "alwaysAsked") && !alwaysAllowed) {
+            d.set(true, forKey: "alwaysAsked")
             let a = NSAlert()
             a.messageText = "덮개를 닫아도 작업이 계속되게 할까요?"
-            a.informativeText = "충전기가 연결돼 있을 때만 적용되고, 앱을 종료하면 원래대로 돌아갑니다.\n켜 두면 앱을 열 때마다 관리자 암호를 한 번 물어봐요. 메뉴에서 언제든 바꿀 수 있어요."
-            a.addButton(withTitle: "켜기")
+            a.informativeText = "충전기가 연결돼 있을 때만 적용되고, 앱을 종료하면 원래대로 돌아갑니다.\n\n항상 허용: 지금 관리자 암호 한 번만 넣으면 다음부터 묻지 않아요. (덮개 잠자기 켜기/끄기 명령만 허용, 메뉴에서 해제 가능)\n매번 암호: 앱을 열 때마다 암호를 물어봐요."
+            a.addButton(withTitle: "항상 허용")
+            a.addButton(withTitle: "매번 암호")
             a.addButton(withTitle: "안 함")
-            d.set(a.runModal() == .alertFirstButtonReturn, forKey: lidKey)
+            let r = a.runModal()
+            d.set(r != .alertThirdButtonReturn, forKey: lidKey)
+            if r == .alertFirstButtonReturn { _ = installRule() }
         }
-        if d.bool(forKey: lidKey) { enableLidAwake() }
+        if d.bool(forKey: lidKey) { enableLidAwake() } else { updateLidMenu() }
     }
 
     @objc func toggleLid() {
-        if lidOn {
-            if runAdmin("/usr/bin/pmset -c disablesleep 0") { lidOn = false }
-            UserDefaults.standard.set(false, forKey: lidKey)
-        } else {
-            UserDefaults.standard.set(true, forKey: lidKey)
+        UserDefaults.standard.set(!lidOn, forKey: lidKey)
+        lidOn ? disableLidAwake() : enableLidAwake()
+    }
+
+    @objc func toggleAlways() {
+        if alwaysAllowed {
+            if lidOn { disableLidAwake() } // 규칙 지우기 전에 원래대로
+            _ = runAdmin("/bin/rm -f \(rulePath)")
+        } else if installRule() && UserDefaults.standard.bool(forKey: lidKey) && !lidOn {
             enableLidAwake()
         }
-        lidItem.state = lidOn ? .on : .off
+        updateLidMenu()
     }
 
     // Finder 에서 실행된 앱은 PATH 가 짧아 node/claude 를 못 찾으므로 로그인 셸 PATH 를 가져옴
@@ -186,9 +252,11 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
         let android = NSMenuItem(title: "Android 앱 설치…", action: #selector(showAndroid), keyEquivalent: "a")
         android.keyEquivalentModifierMask = [.command, .shift]
         lidItem = NSMenuItem(title: "덮개 닫아도 계속 실행 (충전 중)", action: #selector(toggleLid), keyEquivalent: "")
+        alwaysItem = NSMenuItem(title: "    암호 묻지 않기 (항상 허용)", action: #selector(toggleAlways), keyEquivalent: "")
         sub("Token Relay", [
             android,
             lidItem,
+            alwaysItem,
             .separator(),
             NSMenuItem(title: "Token Relay 종료 (작업도 멈춤)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"),
         ])
@@ -213,8 +281,11 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
 
     func applicationWillTerminate(_ n: Notification) {
         quitting = true
-        // 감시가 죽었으면 직접 원래대로 (관리자 암호 한 번 더)
-        if lidOn && !lidWatcherAlive() { _ = runAdmin("/usr/bin/pmset -c disablesleep 0") }
+        // 원래대로: 항상 허용이면 바로, 아니면 감시가 죽었을 때만 직접 (관리자 암호 한 번 더)
+        if lidOn {
+            if alwaysAllowed { _ = sudoPmset(0) }
+            else if !lidWatcherAlive() { _ = runAdmin("/usr/bin/pmset -c disablesleep 0") }
+        }
         server?.terminate()
         server?.waitUntilExit()
     }
