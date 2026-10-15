@@ -80,6 +80,9 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
         return ok
     }
 
+    // 앱을 재시작하면 이전 앱의 감시가 새 앱이 켠 설정을 끄지 않도록: Token Relay 가 다시 떠 있으면 되돌리지 않음
+    let keepIfRunning = "/usr/bin/pgrep -x TokenRelay >/dev/null ||"
+
     func enableLidAwake() {
         if alwaysAllowed {
             lidOn = sudoPmset(1)
@@ -87,7 +90,7 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
             if lidOn {
                 let w = Process()
                 w.executableURL = URL(fileURLWithPath: "/bin/sh")
-                w.arguments = ["-c", "trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/sudo -n /usr/bin/pmset -c disablesleep 0"]
+                w.arguments = ["-c", "trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; \(keepIfRunning) /usr/bin/sudo -n /usr/bin/pmset -c disablesleep 0"]
                 w.standardInput = FileHandle.nullDevice
                 w.standardOutput = FileHandle.nullDevice
                 w.standardError = FileHandle.nullDevice
@@ -95,7 +98,7 @@ final class App: NSObject, NSApplicationDelegate, WKUIDelegate {
             }
         } else {
             // 켜면서, 이 앱 프로세스가 사라질 때까지 기다렸다가 0 으로 되돌리는 root 감시를 같이 띄움
-            lidOn = runAdmin("/usr/bin/pmset -c disablesleep 1; /usr/bin/nohup /bin/sh -c 'trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; /usr/bin/pmset -c disablesleep 0' </dev/null >/dev/null 2>&1 &")
+            lidOn = runAdmin("/usr/bin/pmset -c disablesleep 1; /usr/bin/nohup /bin/sh -c 'trap : HUP INT TERM; while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 5; done; \(keepIfRunning) /usr/bin/pmset -c disablesleep 0' </dev/null >/dev/null 2>&1 &")
         }
         updateLidMenu()
     }
