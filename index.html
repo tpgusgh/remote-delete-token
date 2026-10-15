@@ -87,6 +87,16 @@
   .mcp .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--bad); }
   .mcp .dot.ok { background: var(--ok); } .mcp .dot.warn { background: var(--warn); }
   select.model { min-width: 0; }
+  /* 반응형: 긴 세션 제목/경로가 화면을 밀어내지 않게 */
+  html, body { overflow-x: hidden; }
+  main, .card, form, .browser { min-width: 0; }
+  form { grid-template-columns: minmax(0, 1fr); }
+  .row > * { min-width: 0; }
+  .row > button, .row > .pill, .row > .switch { flex: none; }
+  input, select, textarea { max-width: 100%; }
+  select { text-overflow: ellipsis; }
+  .card { overflow-wrap: anywhere; }
+  .row > .followup { flex: 1 1 180px; } /* 좁으면 입력칸 한 줄, 버튼은 아래 줄 */
   .switch { width: 48px; min-height: 28px; height: 28px; padding: 0; border-radius: 99px; background: var(--line); border: 0; position: relative; flex: none; transition: background .15s; }
   .switch i { position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #0004; transition: transform .15s; }
   .switch.on { background: var(--ok); } .switch.on i { transform: translateX(20px); }
@@ -279,7 +289,7 @@ function renderTasks(s) {
         ${t.loop ? `<span class="pill">↻ 반복 ${t.iter || 0}회</span>` : ''}
         <span class="muted grow">${esc(t.cwd)}${t.account ? ' · ' + esc(t.account) : ''}${t.model ? ' · ' + esc(t.model) : ''}${t.effort ? ' · ' + esc(t.effort) : ''}${t.resume ? ' · 기존 세션' : ''}</span>
       </div>
-      ${t.untilWeekly ? `<div class="muted">⏹ ${t.stopAt ? timeText(t.stopAt) + ' 주간 리셋 때 자동 중지' : '주간 리셋 때 자동 중지 (리셋 시각 확인 중)'}</div>` : ''}
+      ${t.untilWeekly ? `<div class="muted">주간 리셋${t.stopAt ? `(${timeText(t.stopAt)})` : ''} 때 자동 중지</div>` : ''}
       ${t.status === 'running'
         ? `<div class="tr" data-tr="${t.id}">${transcript(t)}</div>`
         : `<div class="prompt" style="margin-top:6px">${esc(t.prompt)}</div>

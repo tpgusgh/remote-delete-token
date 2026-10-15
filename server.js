@@ -126,7 +126,7 @@ function enforceWeeklyStops() {
     if (!t.untilWeekly || !['queued', 'running'].includes(t.status)) continue;
     t.stopAt ||= nextWeeklyReset();
     if (!t.stopAt || t.stopAt > now()) continue;
-    log(t, '⏹ 주간 사용량 초기화 시각 도달. 작업 중지');
+    log(t, '주간 사용량 초기화 시각 도달. 작업 중지');
     if (t.status === 'running' && child) { t.stopRequested = true; child.kill('SIGTERM'); }
     else t.status = 'stopped';
     save();
